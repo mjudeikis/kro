@@ -1,0 +1,103 @@
+# RBAC configuration for KRO on remote clusters
+#
+# Apply this to each remote cluster that KRO will manage.
+# This creates the necessary service account and permissions.
+#
+# Usage:
+#   kubectl --context=<remote-cluster> apply -f rbac-remote-cluster.yaml
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kro-system
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kro
+  namespace: kro-system
+
+---
+# Option 1: Cluster Admin (full permissions)
+# Use this for development/testing or when you need full control
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kro-admin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+- kind: ServiceAccount
+  name: kro
+  namespace: kro-system
+
+---
+# Option 2: Restricted permissions (recommended for production)
+# Uncomment and customize based on the resource types KRO will manage
+
+# apiVersion: rbac.authorization.k8s.io/v1
+# kind: ClusterRole
+# metadata:
+#   name: kro-controller
+# rules:
+# # Core resources
+# - apiGroups: [""]
+#   resources: ["pods", "services", "configmaps", "secrets", "persistentvolumeclaims"]
+#   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+# - apiGroups: [""]
+#   resources: ["pods/status", "services/status"]
+#   verbs: ["get", "update", "patch"]
+#
+# # Apps resources
+# - apiGroups: ["apps"]
+#   resources: ["deployments", "statefulsets", "daemonsets", "replicasets"]
+#   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+# - apiGroups: ["apps"]
+#   resources: ["deployments/status", "statefulsets/status", "daemonsets/status"]
+#   verbs: ["get", "update", "patch"]
+#
+# # Networking resources
+# - apiGroups: ["networking.k8s.io"]
+#   resources: ["ingresses", "networkpolicies"]
+#   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+#
+# # Batch resources
+# - apiGroups: ["batch"]
+#   resources: ["jobs", "cronjobs"]
+#   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+#
+# # Events (for status reporting)
+# - apiGroups: [""]
+#   resources: ["events"]
+#   verbs: ["create", "patch"]
+#
+# ---
+# apiVersion: rbac.authorization.k8s.io/v1
+# kind: ClusterRoleBinding
+# metadata:
+#   name: kro-controller
+# roleRef:
+#   apiGroup: rbac.authorization.k8s.io
+#   kind: ClusterRole
+#   name: kro-controller
+# subjects:
+# - kind: ServiceAccount
+#   name: kro
+#   namespace: kro-system
+
+---
+# Create a long-lived token for the service account
+# Note: In Kubernetes 1.24+, tokens are not automatically created
+# This creates a token that can be used in the kubeconfig
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kro-token
+  namespace: kro-system
+  annotations:
+    kubernetes.io/service-account.name: kro
+type: kubernetes.io/service-account-token

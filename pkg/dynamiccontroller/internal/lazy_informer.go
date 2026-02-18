@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/metadata"
@@ -83,14 +84,31 @@ func (w *LazyInformer) ensureInformer() {
 	).Informer()
 
 	_ = inf.SetWatchErrorHandler(func(_ *cache.Reflector, err error) {
-		w.log.V(1).Error(err, "watch error for lazy informer", "gvr", w.gvr)
+		// In multicluster environments, "not found" errors are expected when a CRD
+		// hasn't been propagated to a remote cluster yet. Log these at a higher
+		// verbosity level to reduce noise.
+		if apierrors.IsNotFound(err) {
+			w.log.V(2).Info("Resource not found (CRD may not exist yet, will retry)", "gvr", w.gvr)
+		} else {
+			w.log.V(1).Error(err, "watch error for lazy informer", "gvr", w.gvr)
+		}
 	})
 
 	w.informer = inf
 }
 
 // AddHandler registers a new event handler and starts the informer if needed.
+// In multicluster environments, the CRD being watched may not exist yet on all clusters
+// (e.g., it needs to be propagated from a central cluster). In this case, the informer
+// will keep retrying in the background until the CRD becomes available.
+// Set waitForSync=true to block until the informer has synced (fail if CRD doesn't exist).
+// Set waitForSync=false to return immediately and let the informer sync in the background.
 func (w *LazyInformer) AddHandler(ctx context.Context, id string, h cache.ResourceEventHandler) error {
+	return w.AddHandlerWithOptions(ctx, id, h, true)
+}
+
+// AddHandlerWithOptions is like AddHandler but allows configuring whether to wait for sync.
+func (w *LazyInformer) AddHandlerWithOptions(ctx context.Context, id string, h cache.ResourceEventHandler, waitForSync bool) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -115,13 +133,19 @@ func (w *LazyInformer) AddHandler(ctx context.Context, id string, h cache.Resour
 		done := w.done
 		go w.run(inf, done)
 
-		if !cache.WaitForCacheSync(done, inf.HasSynced) {
-			w.log.Error(fmt.Errorf("cache sync failed"), "lazy informer sync failure", "gvr", w.gvr)
-			w.cancel()
-			w.cancel = nil
-			w.informer = nil
-			w.handlers = make(map[string]cache.ResourceEventHandlerRegistration)
-			return fmt.Errorf("failed to sync informer for %s", w.gvr)
+		if waitForSync {
+			if !cache.WaitForCacheSync(done, inf.HasSynced) {
+				w.log.Error(fmt.Errorf("cache sync failed"), "lazy informer sync failure", "gvr", w.gvr)
+				w.cancel()
+				w.cancel = nil
+				w.informer = nil
+				w.handlers = make(map[string]cache.ResourceEventHandlerRegistration)
+				return fmt.Errorf("failed to sync informer for %s", w.gvr)
+			}
+		} else {
+			// Don't wait for sync - informer will keep retrying in background.
+			// This is useful in multicluster scenarios where the CRD might not exist yet.
+			w.log.V(1).Info("Started informer without waiting for sync", "gvr", w.gvr)
 		}
 	}
 	return nil

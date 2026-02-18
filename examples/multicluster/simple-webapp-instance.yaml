@@ -1,0 +1,28 @@
+# Simple WebApp Instance
+#
+# Apply this to any cluster (host or remote) that KRO is managing:
+#   kubectl --context=<cluster-name> apply -f simple-webapp-instance.yaml
+#
+# KRO will create the Deployment and Service on the same cluster
+# where the instance is created.
+
+apiVersion: kro.run/v1alpha1
+kind: SimpleWebApp
+metadata:
+  name: my-webapp
+  namespace: default
+spec:
+  # Application name - used for resource naming and labels
+  name: my-webapp
+
+  # Number of replicas
+  replicas: 2
+
+  # Container image (defaults to nginx:latest)
+  image: nginx:1.25
+
+  # Container port (defaults to 80)
+  port: 80
+
+  # Service type: ClusterIP, NodePort, or LoadBalancer
+  serviceType: ClusterIP

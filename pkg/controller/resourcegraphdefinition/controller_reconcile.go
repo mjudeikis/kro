@@ -121,7 +121,7 @@ func (r *ResourceGraphDefinitionReconciler) setupMicroController(
 		},
 		gvr,
 		processedRGD,
-		r.clientSet,
+		r.clusterClientFactory,
 		labeler,
 	)
 }
@@ -181,7 +181,16 @@ func (r *ResourceGraphDefinitionReconciler) reconcileResourceGraphDefinitionMicr
 	ctrl.LoggerFrom(ctx).V(1).Info("reconciling resource graph definition micro controller")
 	gvr := processedRGD.Instance.Meta.GVR
 
-	err := r.dynamicController.Register(ctx, gvr, controller.Reconcile, resourceGVRsToWatch...)
+	// Get the GVK from the CRD spec - this is passed explicitly to support multicluster
+	// scenarios where the CRD might not exist on remote clusters yet.
+	crd := processedRGD.CRD
+	gvk := schema.GroupVersionKind{
+		Group:   crd.Spec.Group,
+		Version: crd.Spec.Versions[0].Name, // Use the first (served) version
+		Kind:    crd.Spec.Names.Kind,
+	}
+
+	err := r.dynamicController.Register(ctx, gvr, gvk, controller.Reconcile, resourceGVRsToWatch...)
 	if err != nil {
 		return newMicroControllerError(err)
 	}

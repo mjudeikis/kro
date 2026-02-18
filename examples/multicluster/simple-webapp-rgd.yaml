@@ -1,0 +1,76 @@
+# Simple WebApp ResourceGraphDefinition
+#
+# This RGD creates a simple web application with:
+# - A Deployment running nginx
+# - A Service exposing the deployment
+#
+# Apply this to the HOST cluster where KRO is running:
+#   kubectl apply -f simple-webapp-rgd.yaml
+
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: simple-webapp
+spec:
+  schema:
+    apiVersion: v1alpha1
+    kind: SimpleWebApp
+    spec:
+      # Application name (used for labels and naming)
+      name: string
+      # Number of replicas
+      replicas: integer | default=1
+      # Container image to run
+      image: string | default="nginx:latest"
+      # Container port
+      port: integer | default=80
+      # Service type (ClusterIP, NodePort, LoadBalancer)
+      serviceType: string | default="ClusterIP"
+    status:
+      availableReplicas: ${deployment.status.availableReplicas}
+      readyReplicas: ${deployment.status.readyReplicas}
+      serviceEndpoint: ${service.spec.clusterIP}
+
+  resources:
+    - id: deployment
+      template:
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: ${schema.spec.name}
+        spec:
+          replicas: ${schema.spec.replicas}
+          selector:
+            matchLabels:
+              app: ${schema.spec.name}
+          template:
+            metadata:
+              labels:
+                app: ${schema.spec.name}
+            spec:
+              containers:
+                - name: app
+                  image: ${schema.spec.image}
+                  ports:
+                    - containerPort: ${schema.spec.port}
+                  resources:
+                    requests:
+                      cpu: "100m"
+                      memory: "128Mi"
+                    limits:
+                      cpu: "500m"
+                      memory: "256Mi"
+
+    - id: service
+      template:
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: ${schema.spec.name}
+        spec:
+          type: ${schema.spec.serviceType}
+          selector:
+            app: ${schema.spec.name}
+          ports:
+            - port: ${schema.spec.port}
+              targetPort: ${schema.spec.port}

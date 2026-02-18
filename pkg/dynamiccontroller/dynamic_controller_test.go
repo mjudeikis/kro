@@ -310,6 +310,7 @@ func TestRegisterAndUnregisterGVK(t *testing.T) {
 	dc := NewDynamicController(logger, config, client, mapper)
 
 	gvr := schema.GroupVersionResource{Group: "test", Version: "v1", Resource: "tests"}
+	gvk := schema.GroupVersionKind{Group: "test", Version: "v1", Kind: "Test"}
 
 	// Create a context with cancel for running the controller
 	ctx, cancel := context.WithCancel(t.Context())
@@ -328,15 +329,15 @@ func TestRegisterAndUnregisterGVK(t *testing.T) {
 		return nil
 	})
 
-	// Register GVK
-	err := dc.Register(t.Context(), gvr, handlerFunc)
+	// Register GVK - use RegisterWithGVK to avoid mapper lookup
+	err := dc.RegisterWithGVK(t.Context(), gvr, gvk, handlerFunc)
 	require.NoError(t, err)
 
 	_, exists := dc.registrations[gvr]
 	assert.True(t, exists)
 
 	// Try to register again (should not fail)
-	err = dc.Register(t.Context(), gvr, handlerFunc)
+	err = dc.RegisterWithGVK(t.Context(), gvr, gvk, handlerFunc)
 	assert.NoError(t, err)
 
 	// Unregister GVK
@@ -395,6 +396,7 @@ func TestInstanceUpdatePolicy(t *testing.T) {
 
 	client := fake.NewSimpleMetadataClient(scheme, obj1, obj2)
 	mapper := meta.NewDefaultRESTMapper(scheme.PreferredVersionAllGroups())
+	mapper.Add(gvk, meta.RESTScopeNamespace) // Register the GVK with the mapper
 
 	dc := NewDynamicController(logger, Config{}, client, mapper)
 	ctx := t.Context()
@@ -662,8 +664,11 @@ func TestChildHandler_LabelFiltering(t *testing.T) {
 
 	dc := NewDynamicController(noopLogger(), testConfig(), client, mapper)
 
-	handler, err := dc.handlerForChildGVR(parentGVR, childGVR)
+	// Get the GVK from the mapper
+	parentGVK, err := mapper.KindFor(parentGVR)
 	require.NoError(t, err)
+
+	handler := dc.handlerForChildGVR(parentGVR, parentGVK, childGVR)
 
 	funcs := handler.(cache.ResourceEventHandlerFuncs)
 
@@ -790,7 +795,10 @@ func TestChildHandler_LabelFiltering(t *testing.T) {
 	})
 }
 
-func TestHandlerForChildGVR_MapperError(t *testing.T) {
+// TestHandlerForChildGVR_WithExplicitGVK verifies that handlerForChildGVR works correctly
+// when given an explicit GVK (useful in multicluster scenarios where the CRD might not
+// exist on the target cluster).
+func TestHandlerForChildGVR_WithExplicitGVK(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, v1.AddMetaToScheme(scheme))
 
@@ -799,12 +807,15 @@ func TestHandlerForChildGVR_MapperError(t *testing.T) {
 
 	dc := NewDynamicController(noopLogger(), testConfig(), client, mapper)
 
+	// Use a GVR that the mapper doesn't know about
 	parentGVR := schema.GroupVersionResource{Group: "unknown", Version: "v1", Resource: "unknowns"}
+	// But provide the GVK explicitly - this should work even if mapper doesn't know about it
+	parentGVK := schema.GroupVersionKind{Group: "unknown", Version: "v1", Kind: "Unknown"}
 	childGVR := schema.GroupVersionResource{Group: "", Version: "v1", Resource: "secrets"}
 
-	_, err := dc.handlerForChildGVR(parentGVR, childGVR)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "failed")
+	// Should not panic or error since we're providing the GVK explicitly
+	handler := dc.handlerForChildGVR(parentGVR, parentGVK, childGVR)
+	assert.NotNil(t, handler)
 }
 
 func TestGracefulShutdown_Timeout(t *testing.T) {
@@ -1014,6 +1025,7 @@ func TestReconcileParentLocked_RemoveHandler(t *testing.T) {
 	mapper := meta.NewDefaultRESTMapper(scheme.PreferredVersionAllGroups())
 
 	gvr := schema.GroupVersionResource{Group: "test", Version: "v1", Resource: "tests"}
+	gvk := schema.GroupVersionKind{Group: "test", Version: "v1", Kind: "Test"}
 
 	dc := NewDynamicController(noopLogger(), testConfig(), client, mapper)
 
@@ -1029,7 +1041,7 @@ func TestReconcileParentLocked_RemoveHandler(t *testing.T) {
 		return nil
 	})
 
-	err := dc.Register(ctx, gvr, handler)
+	err := dc.RegisterWithGVK(ctx, gvr, gvk, handler)
 	require.NoError(t, err)
 
 	dc.mu.Lock()
@@ -1161,17 +1173,26 @@ func TestReconcileChildrenLocked_HandlerForChildError(t *testing.T) {
 	mapper := meta.NewDefaultRESTMapper(scheme.PreferredVersionAllGroups())
 
 	parentGVR := schema.GroupVersionResource{Group: "missing", Version: "v1", Resource: "parents"}
+	parentGVK := schema.GroupVersionKind{Group: "missing", Version: "v1", Kind: "Parent"}
 	childGVR := schema.GroupVersionResource{Group: "test", Version: "v1", Resource: "children"}
 
 	dc := NewDynamicController(noopLogger(), testConfig(), client, mapper)
-	reg := &registration{parentGVR: parentGVR, childHandlerIDs: make(map[schema.GroupVersionResource]string)}
+	reg := &registration{
+		parentGVR:       parentGVR,
+		parentGVK:       parentGVK,
+		childHandlerIDs: make(map[schema.GroupVersionResource]string),
+	}
+
+	ctx := t.Context()
+	dc.ctx.Store(&ctx) // Simulate dc.Start() so that adding handlers works
 
 	dc.mu.Lock()
 	err := dc.reconcileChildrenLocked(parentGVR, []schema.GroupVersionResource{childGVR}, reg)
 	dc.mu.Unlock()
 
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "creating child handler")
+	// Now that we pass the parentGVK explicitly, the handler creation should succeed
+	// (the error was because the mapper couldn't find the GVK, which is no longer an issue)
+	assert.NoError(t, err)
 }
 
 func TestReconcileChildrenLocked_RemoveObsolete(t *testing.T) {
@@ -1182,11 +1203,13 @@ func TestReconcileChildrenLocked_RemoveObsolete(t *testing.T) {
 	parentGVR := schema.GroupVersionResource{Group: "", Version: "v1", Resource: "configmaps"}
 	parentGVK := schema.GroupVersionKind{Group: "", Version: "v1", Kind: "ConfigMap"}
 	child1GVR := schema.GroupVersionResource{Group: "", Version: "v1", Resource: "secrets"}
+	child1GVK := schema.GroupVersionKind{Group: "", Version: "v1", Kind: "Secret"}
 	child2GVR := schema.GroupVersionResource{Group: "", Version: "v1", Resource: "pods"}
 	child2GVK := schema.GroupVersionKind{Group: "", Version: "v1", Kind: "Pod"}
 
 	mapper := meta.NewDefaultRESTMapper(scheme.PreferredVersionAllGroups())
 	mapper.Add(parentGVK, meta.RESTScopeNamespace)
+	mapper.Add(child1GVK, meta.RESTScopeNamespace)
 	mapper.Add(child2GVK, meta.RESTScopeNamespace)
 
 	client := fake.NewSimpleMetadataClient(scheme)
@@ -1283,6 +1306,7 @@ func TestRegister_AddHandlerError(t *testing.T) {
 	mapper := meta.NewDefaultRESTMapper(scheme.PreferredVersionAllGroups())
 
 	gvr := schema.GroupVersionResource{Group: "test", Version: "v1", Resource: "tests"}
+	gvk := schema.GroupVersionKind{Group: "test", Version: "v1", Kind: "Test"}
 
 	dc := NewDynamicController(noopLogger(), testConfig(), client, mapper)
 
@@ -1300,7 +1324,8 @@ func TestRegister_AddHandlerError(t *testing.T) {
 		return nil
 	})
 
-	err := dc.Register(ctx, gvr, handler)
+	// Use RegisterWithGVK to bypass mapper lookup and trigger the add handler error
+	err := dc.RegisterWithGVK(ctx, gvr, gvk, handler)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "add parent handler")
 }

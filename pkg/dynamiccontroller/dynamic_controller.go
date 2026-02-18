@@ -115,6 +115,12 @@ type Config struct {
 	BurstLimit int
 	// QueueShutdownTimeout is the maximum time to wait for the queue to drain before shutting down.
 	QueueShutdownTimeout time.Duration
+	// WaitForSync controls whether Register should wait for informer cache sync.
+	// In multicluster environments, CRDs might not exist yet on remote clusters
+	// (they need to be propagated from a central cluster). Setting this to false
+	// allows the informer to keep retrying in the background until the CRD is available.
+	// Default is true (wait for sync).
+	WaitForSync *bool
 }
 
 // Handler is used to actually perform the reconciliation logic for an instance GVR and will operate
@@ -131,6 +137,11 @@ type ObjectIdentifiers struct {
 // Each parent may own one "parent handler" and multiple "child handlers".
 type registration struct {
 	parentGVR schema.GroupVersionResource
+	// parentGVK is the GroupVersionKind for the parent. This is used by child handlers
+	// to filter events. In multicluster scenarios, the mapper on remote clusters might
+	// not know about the parent GVK if the CRD hasn't been propagated yet, so we store
+	// it explicitly during registration.
+	parentGVK schema.GroupVersionKind
 
 	parentHandlerID string
 	childHandlerIDs map[schema.GroupVersionResource]string
@@ -163,6 +174,9 @@ type DynamicController struct {
 	// It is set by Start and meant to be used to register the controller context with a global handler
 	// such as the controller-runtime manager. Thread-safe.
 	ctx atomic.Pointer[context.Context]
+
+	// started is closed when Start has initialized the controller and it's ready to accept registrations.
+	started chan struct{}
 
 	// mu is a global mutex protecting watches and registrations.
 	// Required because StartServingGVK and StopServiceGVK may run concurrently,
@@ -218,6 +232,7 @@ func NewDynamicController(
 		mapper:        mapper,
 		watches:       make(map[schema.GroupVersionResource]*internal.LazyInformer),
 		registrations: make(map[schema.GroupVersionResource]*registration),
+		started:       make(chan struct{}),
 		queue: workqueue.NewTypedRateLimitingQueueWithConfig(workqueue.NewTypedMaxOfRateLimiter(
 			workqueue.NewTypedItemExponentialFailureRateLimiter[ObjectIdentifiers](config.MinRetryDelay, config.MaxRetryDelay),
 			&workqueue.TypedBucketRateLimiter[ObjectIdentifiers]{Limiter: rate.NewLimiter(rate.Limit(config.RateLimit), config.BurstLimit)},
@@ -231,6 +246,9 @@ func (dc *DynamicController) Start(ctx context.Context) error {
 		return fmt.Errorf("already running")
 	}
 
+	// Signal that the controller is ready to accept registrations
+	close(dc.started)
+
 	defer utilruntime.HandleCrash()
 
 	dc.log.Info("Starting dynamic controller")
@@ -243,6 +261,18 @@ func (dc *DynamicController) Start(ctx context.Context) error {
 
 	<-ctx.Done()
 	return dc.gracefulShutdown()
+}
+
+// WaitUntilStarted blocks until the DynamicController has been started
+// and is ready to accept registrations. Returns an error if the context
+// is cancelled before the controller is ready.
+func (dc *DynamicController) WaitUntilStarted(ctx context.Context) error {
+	select {
+	case <-dc.started:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (dc *DynamicController) worker(ctx context.Context) {
@@ -366,11 +396,40 @@ func (dc *DynamicController) updateFunc(parentGVR schema.GroupVersionResource, o
 }
 
 // Register registers parent and children via reconciliation.
+// This method looks up the parent GVK from the REST mapper. In multicluster scenarios
+// where the CRD might not exist on the target cluster, use RegisterWithGVK instead.
 func (dc *DynamicController) Register(
 	_ context.Context,
 	parent schema.GroupVersionResource,
 	instanceHandler Handler,
 	resourceGVRsToWatch ...schema.GroupVersionResource,
+) error {
+	// Look up the GVK from the mapper
+	parentGVK, err := dc.mapper.KindFor(parent)
+	if err != nil {
+		return fmt.Errorf("failed to get parent gvk from %s: %w", keyFromGVR(parent), err)
+	}
+	return dc.registerWithGVKInternal(parent, parentGVK, instanceHandler, resourceGVRsToWatch)
+}
+
+// RegisterWithGVK registers parent and children via reconciliation, using the provided GVK.
+// This is useful in multicluster scenarios where the CRD might not exist on the target cluster
+// yet (e.g., it needs to be propagated from a central cluster), so the mapper can't look it up.
+func (dc *DynamicController) RegisterWithGVK(
+	_ context.Context,
+	parent schema.GroupVersionResource,
+	parentGVK schema.GroupVersionKind,
+	instanceHandler Handler,
+	resourceGVRsToWatch ...schema.GroupVersionResource,
+) error {
+	return dc.registerWithGVKInternal(parent, parentGVK, instanceHandler, resourceGVRsToWatch)
+}
+
+func (dc *DynamicController) registerWithGVKInternal(
+	parent schema.GroupVersionResource,
+	parentGVK schema.GroupVersionKind,
+	instanceHandler Handler,
+	resourceGVRsToWatch []schema.GroupVersionResource,
 ) error {
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
@@ -379,9 +438,13 @@ func (dc *DynamicController) Register(
 	if !exists {
 		reg = &registration{
 			parentGVR:       parent,
+			parentGVK:       parentGVK,
 			childHandlerIDs: make(map[schema.GroupVersionResource]string),
 		}
 		dc.registrations[parent] = reg
+	} else {
+		// Update the GVK in case it changed
+		reg.parentGVK = parentGVK
 	}
 
 	if err := dc.reconcileParentLocked(parent, instanceHandler, reg); err != nil {
@@ -476,11 +539,16 @@ func (dc *DynamicController) reconcileParentLocked(
 	// create handler if missing
 	if reg.parentHandlerID == "" {
 		parentHandlerID := parentHandlerID(parent)
-		if err := w.AddHandler(*dc.ctx.Load(), parentHandlerID, cache.ResourceEventHandlerFuncs{
+		// Determine whether to wait for cache sync
+		waitForSync := true // default
+		if dc.config.WaitForSync != nil {
+			waitForSync = *dc.config.WaitForSync
+		}
+		if err := w.AddHandlerWithOptions(*dc.ctx.Load(), parentHandlerID, cache.ResourceEventHandlerFuncs{
 			AddFunc:    func(obj interface{}) { dc.enqueueParent(parent, obj, eventTypeAdd) },
 			UpdateFunc: func(oldObj, newObj interface{}) { dc.updateFunc(parent, oldObj, newObj) },
 			DeleteFunc: func(obj interface{}) { dc.enqueueParent(parent, obj, eventTypeDelete) },
-		}); err != nil {
+		}, waitForSync); err != nil {
 			return fmt.Errorf("add parent handler %s: %w", parent, err)
 		}
 		reg.parentHandlerID = parentHandlerID
@@ -534,12 +602,14 @@ func (dc *DynamicController) reconcileChildrenLocked(
 		}
 		w := dc.ensureWatchLocked(child)
 		childHandlerID := childHandlerID(parent, child)
-		childHandler, err := dc.handlerForChildGVR(parent, child)
-		if err != nil {
-			return fmt.Errorf("creating child handler for %s for parent %s failed: %w", child, parent, err)
-		}
+		childHandler := dc.handlerForChildGVR(parent, reg.parentGVK, child)
 
-		if err := w.AddHandler(*dc.ctx.Load(), childHandlerID, childHandler); err != nil {
+		// Determine whether to wait for cache sync
+		waitForSync := true // default
+		if dc.config.WaitForSync != nil {
+			waitForSync = *dc.config.WaitForSync
+		}
+		if err := w.AddHandlerWithOptions(*dc.ctx.Load(), childHandlerID, childHandler, waitForSync); err != nil {
 			return fmt.Errorf("add child handler %s: %w", child, err)
 		}
 		reg.childHandlerIDs[child] = childHandlerID
@@ -572,12 +642,11 @@ func (dc *DynamicController) removeHandlerLocked(gvr schema.GroupVersionResource
 	return nil
 }
 
-func (dc *DynamicController) handlerForChildGVR(parent, child schema.GroupVersionResource) (cache.ResourceEventHandler, error) {
+// handlerForChildGVR creates a child event handler that enqueues the parent when a child resource changes.
+// The parentGVK is passed explicitly rather than looked up from the mapper, which is important in
+// multicluster scenarios where the CRD might not exist on the remote cluster yet.
+func (dc *DynamicController) handlerForChildGVR(parent schema.GroupVersionResource, parentGVK schema.GroupVersionKind, child schema.GroupVersionResource) cache.ResourceEventHandler {
 	parentGVRKey, childGVRKey := keyFromGVR(parent), keyFromGVR(child)
-	parentGVK, err := dc.mapper.KindFor(parent)
-	if err != nil {
-		return nil, fmt.Errorf("failed ot get parent gvk from %s for child handler: %w", parentGVRKey, err)
-	}
 	handle := func(obj interface{}, eventType string) {
 		objMeta, err := meta.Accessor(obj)
 		if err != nil {
@@ -628,7 +697,7 @@ func (dc *DynamicController) handlerForChildGVR(parent, child schema.GroupVersio
 		AddFunc:    func(obj interface{}) { handle(obj, eventTypeAdd) },
 		UpdateFunc: func(oldObj, newObj interface{}) { handle(newObj, eventTypeUpdate) },
 		DeleteFunc: func(obj interface{}) { handle(obj, eventTypeDelete) },
-	}, nil
+	}
 }
 
 func (dc *DynamicController) gracefulShutdown() error {

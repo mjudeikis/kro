@@ -74,27 +74,28 @@ type ReconcileConfig struct {
 // and its sub-resources.
 // Controller owns reconciliation for instances of a ResourceGraphDefinition.
 type Controller struct {
-	log    logr.Logger
-	client kroclient.SetInterface
-	gvr    schema.GroupVersionResource
-	rgd    *graph.Graph
+	log           logr.Logger
+	clientFactory *kroclient.ClusterClientFactory
+	gvr           schema.GroupVersionResource
+	rgd           *graph.Graph
 
 	labeler         metadata.Labeler
 	reconcileConfig ReconcileConfig
 }
 
 // NewController constructs a new controller with static RGD.
+// The clientFactory provides cluster-specific clients for multicluster support.
 func NewController(
 	log logr.Logger,
 	reconcileConfig ReconcileConfig,
 	gvr schema.GroupVersionResource,
 	rgd *graph.Graph,
-	client kroclient.SetInterface,
+	clientFactory *kroclient.ClusterClientFactory,
 	labeler metadata.Labeler,
 ) *Controller {
 	return &Controller{
 		log:             log,
-		client:          client,
+		clientFactory:   clientFactory,
 		gvr:             gvr,
 		rgd:             rgd,
 		labeler:         labeler,
@@ -103,13 +104,24 @@ func NewController(
 }
 
 // Reconcile implements the controller-runtime Reconcile interface.
-func (c *Controller) Reconcile(ctx context.Context, req ctrl.Request) (err error) {
-	log := c.log.WithValues("namespace", req.Namespace, "name", req.Name)
+// The clusterName parameter indicates which cluster the resource is from.
+// For single-cluster mode, this will be an empty string.
+func (c *Controller) Reconcile(ctx context.Context, clusterName string, req ctrl.Request) (err error) {
+	log := c.log.WithValues("namespace", req.Namespace, "name", req.Name, "cluster", clusterName)
+
+	//--------------------------------------------------------------
+	// 0. Get cluster-specific clients
+	//--------------------------------------------------------------
+	clusterClients, err := c.clientFactory.GetClients(clusterName)
+	if err != nil {
+		log.Error(err, "failed to get cluster clients")
+		return err
+	}
 
 	//--------------------------------------------------------------
 	// 1. Load instance; if gone, nothing to do
 	//--------------------------------------------------------------
-	inst, err := c.client.Dynamic().
+	inst, err := clusterClients.Dynamic.
 		Resource(c.gvr).
 		Namespace(req.Namespace).
 		Get(ctx, req.Name, metav1.GetOptions{})
@@ -135,9 +147,9 @@ func (c *Controller) Reconcile(ctx context.Context, req ctrl.Request) (err error
 	// 3. Build reconciliation context (clients, mapper, labeler, runtime)
 	//--------------------------------------------------------------
 	rcx := NewReconcileContext(
-		ctx, log, c.gvr,
-		c.client.Dynamic(),
-		c.client.RESTMapper(),
+		ctx, log, clusterName, c.gvr,
+		clusterClients.Dynamic,
+		clusterClients.RESTMapper,
 		c.labeler,
 		runtimeObj,
 		c.reconcileConfig,

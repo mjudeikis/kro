@@ -141,7 +141,7 @@ func (c *Controller) updateStatus(rcx *ReconcileContext) error {
 	inst.Object["status"] = status
 
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		cur, err := c.client.Dynamic().
+		cur, err := rcx.Client.
 			Resource(c.gvr).
 			Namespace(inst.GetNamespace()).
 			Get(rcx.Ctx, inst.GetName(), metav1.GetOptions{})
@@ -149,7 +149,7 @@ func (c *Controller) updateStatus(rcx *ReconcileContext) error {
 			return err
 		}
 		cur.Object["status"] = status
-		_, err = c.client.Dynamic().
+		_, err = rcx.Client.
 			Resource(c.gvr).
 			Namespace(inst.GetNamespace()).
 			UpdateStatus(rcx.Ctx, cur, metav1.UpdateOptions{})
